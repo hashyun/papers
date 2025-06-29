@@ -1,3 +1,7 @@
+import numpy as np
+import pandas as pd
+
+
 def get_most_recent_granger_lags(granger_df: pd.DataFrame, target_variable: str = 'Exceedance') -> pd.DataFrame:
     """
     그랜저 인과관계 분석 결과에서 각 원인 변수가 타겟 변수에 영향을 미치는
