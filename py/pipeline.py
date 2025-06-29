@@ -5,7 +5,8 @@ import numpy as np
 from adf import check_stationarity
 from granger_analysis import run_granger_analysis_pipeline
 from hill_plot_new import select_threshold
-import l1_l2_gpd_new # Import the whole module
+from lag import create_lagged_features
+import l1_l2_gpd_new  # Import the whole module
 
 def main():
     """
@@ -15,7 +16,9 @@ def main():
     print("--- 1. Loading Data ---")
     n_samples = 2000
     rng = np.random.default_rng(42)
+    dates = pd.date_range(start="2000-01-01", periods=n_samples, freq="D")
     data = {
+        'Date': dates,
         'feature1': np.random.randn(n_samples).cumsum() + 50,
         'feature2': np.random.randn(n_samples).cumsum() + 20,
         'target': np.random.randn(n_samples)
@@ -56,22 +59,34 @@ def main():
     # In a real-world scenario, you might use these results to select your features.
     # For this pipeline, we'll proceed with the predefined FEATURE_COLS.
 
-    # --- 4. Hill Plot for Threshold Selection ---
+    # --- 4. Creating Lagged Features ---
     print()
-    print(f"--- 4. Running Hill Plot on Target Column: '{TARGET_COL}' ---")
-    # We use the original, non-differenced target variable for threshold selection.
-    target_series = df[TARGET_COL].dropna().values
+    print("--- 4. Creating Lagged Features ---")
+    lag_config = {col: [1, 2, 5] for col in FEATURE_COLS}
+    df_lagged, lagged_feature_names = create_lagged_features(
+        df=df.copy(),
+        target_col=TARGET_COL,
+        lag_config=lag_config,
+        date_col='Date',
+        start_year=df['Date'].dt.year.min(),
+    )
+
+    # --- 5. Hill Plot for Threshold Selection ---
+    print()
+    print(f"--- 5. Running Hill Plot on Target Column: '{TARGET_COL}' ---")
+    # Use the lagged dataset's target column for threshold selection.
+    target_series = df_lagged[TARGET_COL].dropna().values
     
     # The select_threshold function returns: u_hat, k_hat, gamma_hat
     threshold, _, _ = select_threshold(target_series)
     print(f"Threshold selected via Hill Plot: {threshold:.4f}")
 
-    # --- 5. L2 / GPD Modeling ---
+    # --- 6. L2 / GPD Modeling ---
     print()
-    print("--- 5. Running L2-CART and GPD-CART Models ---")
-    # This is the final step, using the original data and the calculated threshold.
+    print("--- 6. Running L2-CART and GPD-CART Models ---")
+    # This step uses the lagged data and the calculated threshold.
     pipeline_results = l1_l2_gpd_new.run_l1_l2_gpd_pipeline(
-        df=df.copy(),
+        df=df_lagged,
         target_col=TARGET_COL,
         feature_cols=FEATURE_COLS,
         threshold=threshold,
@@ -81,7 +96,9 @@ def main():
         min_leaf_gpd=30,
         cv_folds_gpd=5,
         run_l2=True,
-        run_gpd=True
+        run_gpd=True,
+        df_processed=df_lagged,
+        lagged_feature_names=lagged_feature_names,
     )
 
     print()
