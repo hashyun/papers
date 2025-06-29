@@ -11,37 +11,6 @@ from dataclasses import dataclass
 import math
 
 # ---------------------------------------------------------------------#
-# Logging & Constants
-# ---------------------------------------------------------------------#
-logging.basicConfig(level=logging.INFO,
-                    format='[%(asctime)s] %(levelname)s: %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S')
-
-@dataclass(frozen=True)
-class Constants:
-    """Global constants for the module."""
-    SEED: int = 42
-    MIN_FLOAT: float = np.finfo(float).eps  # Smallest positive float
-    LARGE_FLOAT: float = 1e30               # Large number for infinite costs
-    GPD_GAMMA_BOUNDS: Tuple[float, float] = (-0.5, 0.95)
-    GPD_MIN_LEAF_DEFAULT: int = 30          # Default min samples for a GPD leaf
-    AIC_PENALTY: float = 2.0                # Penalty per parameter in AIC
-
-C = Constants()
-rng = np.random.default_rng(C.SEED)
-
-# ---------------------------------------------------------------------#
-# 0. Utility & Loss Functions
-# ---------------------------------------------------------------------#
-def mse_loss(y: np.ndarray, mu: float) -> float:
-    """Calculate Sum of Squared Errors."""
-    return np.sum((y - mu) ** 2) if len(y) > 0 else 0.0
-
-def mae_loss(y: np.ndarray, md: float) -> float:
-    """Calculate Sum of Absolute Errors."""
-    return np.sum(np.abs(y - md)) if len(y) > 0 else 0.0
-
-# ---------------------------------------------------------------------#
 # 1. Node Classes
 # ---------------------------------------------------------------------#
 @dataclass
@@ -76,8 +45,207 @@ class NodeL2(NodeBase):
 class NodeGPD(NodeBase):
     """Node for GPD CART."""
     gpd_params: Optional[Tuple[float, float]] = None # (sigma, gamma)
-    nll: float = C.LARGE_FLOAT # Negative Log-Likelihood at this node
+    nll: float = 1e30 # Negative Log-Likelihood at this node
     split_gain: float = 0.0  # Penalized NLL reduction
+
+def run_l1_l2_gpd_pipeline(
+    df: pd.DataFrame,
+    target_col: str,
+    feature_cols: List[str],
+    threshold: float,
+    lags: List[int] = [1, 2, 3],
+    max_depth: int = 5,
+    min_leaf_l2: int = 30,
+    min_leaf_gpd: int = 30,
+    cv_folds_gpd: int = 5,
+    run_l1: bool = False, # L1 is not fully implemented, so default to False
+    run_l2: bool = True,
+    run_gpd: bool = True
+) -> Dict[str, Any]:
+    """
+    Executes the full pipeline:
+    1. Create lagged features.
+    2. Split data into 'body' (below threshold) and 'tail' (above).
+    3. Fit L2-CART on the body.
+    4. Fit GPD-CART on the tail.
+    5. Prune the GPD-CART using cross-validation.
+    6. Return all models and results.
+    """
+    logging.info("--- Starting L1/L2/GPD Pipeline ---")
+
+    # 1. Create Lagged Features
+    df_processed, lagged_feature_names = create_lagged_features(
+        df, target_col, feature_cols, lags
+    )
+    logging.info(f"Created {len(lagged_feature_names)} lagged features.")
+    
+    X = df_processed[lagged_feature_names].values
+    y = df_processed[target_col].values
+
+    # 2. Split Data
+    mask_tail = y > threshold
+    X_body, y_body = X[~mask_tail], y[~mask_tail]
+    X_tail, y_tail = X[mask_tail], y[mask_tail]
+    
+    # The GPD model fits to the *excesses* over the threshold
+    y_tail_excess = y_tail - threshold
+
+    logging.info(f"Data split by threshold={threshold:.4g}:")
+    logging.info(f"  - Body (y <= thr): {len(y_body)} samples")
+    logging.info(f"  - Tail (y > thr):  {len(y_tail)} samples")
+
+    results = {
+        "threshold": threshold,
+        "lagged_feature_names": lagged_feature_names,
+        "n_body": len(y_body),
+        "n_tail": len(y_tail),
+        "l2_tree": None,
+        "gpd_tree_unpruned": None,
+        "gpd_tree_pruned": None,
+        "best_alpha_gpd": None
+    }
+
+    # 3. Fit L2-CART on Body
+    if run_l2 and len(y_body) > 2 * min_leaf_l2:
+        logging.info("--- Growing L2-CART for the Body ---")
+        l2_tree = grow_tree_l2(
+            X=X_body, y=y_body,
+            feature_names=lagged_feature_names,
+            min_leaf=min_leaf_l2,
+            max_depth=max_depth
+        )
+        # Fit LogNormal distributions to the leaves of the L2 tree
+        assign_lognorm_params(l2_tree, X_body, y_body, trunc_left=0.0)
+        results["l2_tree"] = l2_tree
+        logging.info("L2-CART growth complete.")
+        print_tree_structure(l2_tree, lagged_feature_names)
+
+    # 4. Fit GPD-CART on Tail
+    if run_gpd and len(y_tail) > 2 * min_leaf_gpd:
+        logging.info("--- Growing GPD-CART for the Tail ---")
+        gpd_tree_unpruned = grow_tree_gpd(
+            X=X_tail, y=y_tail_excess,
+            feature_names=lagged_feature_names,
+            min_leaf=min_leaf_gpd,
+            max_depth=max_depth
+        )
+        results["gpd_tree_unpruned"] = gpd_tree_unpruned
+        logging.info("GPD-CART growth complete (unpruned).")
+        print_tree_structure(gpd_tree_unpruned, lagged_feature_names)
+
+        # 5. Prune GPD-CART
+        logging.info("--- Pruning GPD-CART with Cross-Validation ---")
+        gpd_tree_pruned, best_alpha = prune_gpd_with_cv(
+            gpd_tree_unpruned, X_tail, y_tail_excess, n_folds=cv_folds_gpd
+        )
+        results["gpd_tree_pruned"] = gpd_tree_pruned
+        results["best_alpha_gpd"] = best_alpha
+        logging.info("GPD-CART pruning complete.")
+        print_tree_structure(gpd_tree_pruned, lagged_feature_names)
+
+    logging.info("--- Pipeline Finished ---")
+    return results
+
+def create_lagged_features(df: pd.DataFrame,
+                           target_col: str,
+                           cols_to_lag: List[str],
+                           lags: List[int]) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Creates lagged features for specified columns in a DataFrame.
+
+    Args:
+        df: Input DataFrame. Must be sorted by time.
+        target_col: The name of the target variable (y).
+        cols_to_lag: List of column names to create lags for.
+        lags: List of integers specifying the lag periods.
+
+    Returns:
+        A tuple containing:
+        - The DataFrame with added lagged features and NaNs dropped.
+        - A list of the names of the new lagged feature columns.
+    """
+    df_lagged = df.copy()
+    feature_names = []
+
+    for col in cols_to_lag:
+        for lag in lags:
+            new_col_name = f"{col}_lag{lag}"
+            df_lagged[new_col_name] = df_lagged[col].shift(lag)
+            feature_names.append(new_col_name)
+
+    # Drop rows with NaNs created by the shifting process
+    df_lagged = df_lagged.dropna().reset_index(drop=True)
+
+    return df_lagged, feature_names
+
+def print_tree_structure(node: NodeBase, feat_names: List[str], indent: str = ""):
+    """Unified function to print the structure of any supported tree type."""
+    if node is None: return
+
+    # --- Leaf Node ---
+    if node.is_leaf:
+        n_str = f"N={node.n_samples}"
+        if isinstance(node, NodeL2):
+            val_str = f"mean={node.mean_val:.3f}"
+            print(f"{indent}Leaf: {val_str}, {n_str}")
+        elif isinstance(node, NodeGPD):
+            if node.gpd_params:
+                s_str = f"σ={node.gpd_params[0]:.3f}"
+                g_str = f"γ={node.gpd_params[1]:.3f}"
+                nll_str = f"NLL={node.nll:.2f}"
+                print(f"{indent}Leaf: GPD({s_str}, {g_str}), {nll_str}, {n_str}")
+            else:
+                print(f"{indent}Leaf: GPD(params=None), {n_str}")
+        else:
+            print(f"{indent}Leaf: {n_str}")
+        return
+
+    # --- Internal Node ---
+    feat = feat_names[node.split_var]
+    thr = node.split_thr
+    gain_str = ""
+    if hasattr(node, 'gain') and node.gain > 0: # L2
+        gain_str = f"(Gain={node.gain:.3f})"
+    elif hasattr(node, 'split_gain') and node.split_gain > -C.LARGE_FLOAT: # GPD
+        gain_str = f"(PenalizedGain={node.split_gain:.3f})"
+        
+    print(f"{indent}[{feat} <= {thr:.4g}] {gain_str} N={node.n_samples}")
+    
+    print(f"{indent}├─ True:", end="")
+    print_tree_structure(node.left, feat_names, indent + "│  ")
+    print(f"{indent}└─ False:", end="")
+    print_tree_structure(node.right, feat_names, indent + "│  ")
+
+# ---------------------------------------------------------------------#
+# Logging & Constants
+# ---------------------------------------------------------------------#
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] %(levelname)s: %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+
+@dataclass(frozen=True)
+class Constants:
+    """Global constants for the module."""
+    SEED: int = 42
+    MIN_FLOAT: float = np.finfo(float).eps  # Smallest positive float
+    LARGE_FLOAT: float = 1e30               # Large number for infinite costs
+    GPD_GAMMA_BOUNDS: Tuple[float, float] = (-0.5, 0.95)
+    GPD_MIN_LEAF_DEFAULT: int = 30          # Default min samples for a GPD leaf
+    AIC_PENALTY: float = 2.0                # Penalty per parameter in AIC
+
+C = Constants()
+rng = np.random.default_rng(C.SEED)
+
+# ---------------------------------------------------------------------#
+# 0. Utility & Loss Functions
+# ---------------------------------------------------------------------#
+def mse_loss(y: np.ndarray, mu: float) -> float:
+    """Calculate Sum of Squared Errors."""
+    return np.sum((y - mu) ** 2) if len(y) > 0 else 0.0
+
+def mae_loss(y: np.ndarray, md: float) -> float:
+    """Calculate Sum of Absolute Errors."""
+    return np.sum(np.abs(y - md)) if len(y) > 0 else 0.0
 
 # ---------------------------------------------------------------------#
 # 2. Distribution Fitting (LogNormal & GPD)
@@ -339,13 +507,13 @@ def _grow_tree(X: np.ndarray, y: np.ndarray, node_type: type, split_finder: call
 
 # Specific grower functions
 def grow_tree_l2(X, y, **kwargs) -> NodeL2:
-    return _grow_tree(X, y, NodeL2, _best_split_l2, **kwargs)
+    return _grow_tree(X, y, NodeL2, _best_split_l2, depth=0, **kwargs)
 
 def grow_tree_gpd(X, y, **kwargs) -> NodeGPD:
     # Set default min_leaf for GPD if not provided
     if 'min_leaf' not in kwargs:
         kwargs['min_leaf'] = C.GPD_MIN_LEAF_DEFAULT
-    return _grow_tree(X, y, NodeGPD, _best_split_gpd, **kwargs)
+    return _grow_tree(X, y, NodeGPD, _best_split_gpd, depth=0, **kwargs)
 
 # ---------------------------------------------------------------------#
 # 5. Tree Traversal, Evaluation & Pruning
@@ -364,7 +532,10 @@ def assign_lognorm_params(root: Union[NodeL1, NodeL2], X: np.ndarray, y: np.ndar
     if not root: return
     
     leaf_assignments = [find_leaf(root, x_i) for x_i in X]
-    unique_leaves = list(set(leaf_assignments))
+    unique_leaves = []
+    for leaf in leaf_assignments:
+        if leaf not in unique_leaves:
+            unique_leaves.append(leaf)
 
     for leaf in unique_leaves:
         mask = [id(la) == id(leaf) for la in leaf_assignments]
@@ -381,7 +552,10 @@ def get_subtree_nll(tree: NodeGPD, X: np.ndarray, y: np.ndarray) -> float:
     if len(X) == 0: return 0.0
     
     leaf_assignments = [find_leaf(tree, x_i) for x_i in X]
-    unique_leaves = list(set(leaf_assignments))
+    unique_leaves = []
+    for leaf in leaf_assignments:
+        if leaf not in unique_leaves:
+            unique_leaves.append(leaf)
     total_nll = 0.0
 
     for leaf in unique_leaves:
@@ -513,47 +687,3 @@ def prune_gpd_with_cv(root: NodeGPD, X: np.ndarray, y: np.ndarray, n_folds: int 
         seq[0][1].left = seq[0][1].right = None
         
     return final_tree, best_alpha
-
-
-# ---------------------------------------------------------------------#
-# 6. Tree Visualization
-# ---------------------------------------------------------------------#
-def print_tree_structure(node: NodeBase, feat_names: List[str], indent: str = ""):
-    """Unified function to print the structure of any supported tree type."""
-    if node is None: return
-
-    # --- Leaf Node ---
-    if node.is_leaf:
-        n_str = f"N={node.n_samples}"
-        if isinstance(node, NodeL2):
-            val_str = f"mean={node.mean_val:.3f}"
-            print(f"{indent}Leaf: {val_str}, {n_str}")
-        elif isinstance(node, NodeGPD):
-            if node.gpd_params:
-                s_str = f"σ={node.gpd_params[0]:.3f}"
-                g_str = f"γ={node.gpd_params[1]:.3f}"
-                nll_str = f"NLL={node.nll:.2f}"
-                print(f"{indent}Leaf: GPD({s_str}, {g_str}), {nll_str}, {n_str}")
-            else:
-                print(f"{indent}Leaf: GPD(params=None), {n_str}")
-        else:
-            print(f"{indent}Leaf: {n_str}")
-        return
-
-    # --- Internal Node ---
-    feat = feat_names[node.split_var]
-    thr = node.split_thr
-    gain_str = ""
-    if hasattr(node, 'gain') and node.gain > 0: # L2
-        gain_str = f"(Gain={node.gain:.3f})"
-    elif hasattr(node, 'split_gain') and node.split_gain > -C.LARGE_FLOAT: # GPD
-        gain_str = f"(PenalizedGain={node.split_gain:.3f})"
-        
-    print(f"{indent}[{feat} <= {thr:.4g}] {gain_str} N={node.n_samples}")
-    
-    print(f"{indent}├─ True:", end="")
-    print_tree_structure(node.left, feat_names, indent + "│  ")
-    print(f"{indent}└─ False:", end="")
-    print_tree_structure(node.right, feat_names, indent + "│  ")
-    
-# ... (create_lagged_features can remain as is, it's a solid utility) ...
