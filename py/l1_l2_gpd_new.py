@@ -58,26 +58,53 @@ def run_l1_l2_gpd_pipeline(
     min_leaf_l2: int = 30,
     min_leaf_gpd: int = 30,
     cv_folds_gpd: int = 5,
-    run_l1: bool = False, # L1 is not fully implemented, so default to False
+    run_l1: bool = False,  # L1 is not fully implemented, so default to False
     run_l2: bool = True,
-    run_gpd: bool = True
+    run_gpd: bool = True,
+    df_processed: Optional[pd.DataFrame] = None,
+    lagged_feature_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Executes the full pipeline:
-    1. Create lagged features.
+    1. Create lagged features (unless a preprocessed DataFrame is provided).
     2. Split data into 'body' (below threshold) and 'tail' (above).
     3. Fit L2-CART on the body.
     4. Fit GPD-CART on the tail.
     5. Prune the GPD-CART using cross-validation.
     6. Return all models and results.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Original data.
+    target_col : str
+        Name of the target variable.
+    feature_cols : list[str]
+        Columns to create lagged features from when `df_processed` is not
+        supplied.
+    threshold : float
+        Threshold separating body and tail.
+    lags : list[int], optional
+        Lags to apply when creating features.
+    df_processed : pd.DataFrame, optional
+        If given, a DataFrame that already contains the lagged features and
+        the target column. When provided, `lagged_feature_names` must also be
+        supplied and the internal lag creation step is skipped.
+    lagged_feature_names : list[str], optional
+        Names of the lagged feature columns in `df_processed`.
     """
     logging.info("--- Starting L1/L2/GPD Pipeline ---")
 
-    # 1. Create Lagged Features
-    df_processed, lagged_feature_names = create_lagged_features(
-        df, target_col, feature_cols, lags
-    )
-    logging.info(f"Created {len(lagged_feature_names)} lagged features.")
+    # 1. Create Lagged Features unless provided
+    if df_processed is None or lagged_feature_names is None:
+        df_processed, lagged_feature_names = create_lagged_features(
+            df, target_col, feature_cols, lags
+        )
+        logging.info(f"Created {len(lagged_feature_names)} lagged features.")
+    else:
+        logging.info(
+            f"Using pre-generated lagged features ({len(lagged_feature_names)})"
+        )
     
     X = df_processed[lagged_feature_names].values
     y = df_processed[target_col].values
