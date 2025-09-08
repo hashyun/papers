@@ -16,7 +16,7 @@ def check_stationarity_pro(df, adf_thresh=0.05):
     stationarity_results = {}
     for col in df.columns:
         series = df[col].dropna()
-        if len(series) < 20: # 데이터가 너무 적으면 검정 신뢰도 하락
+        if len(series) < 10: # 데이터가 너무 적으면 검정 신뢰도 하락
             print(f"[Info] Not enough data for '{col}'. Assuming non-stationary.")
             stationarity_results[col] = False
             continue
@@ -26,16 +26,20 @@ def check_stationarity_pro(df, adf_thresh=0.05):
         stationarity_results[col] = p_value < adf_thresh
     return stationarity_results
 
+
 def add_diff_columns_pro(
     df, 
     diff_cols, 
     diff_order=1, 
-    transform='log', 
+    transform='log',  # 'log' | 'simple' | 'auto'  ← auto 추가
     suffix="_diff"
 ):
     """
     선택한 컬럼들에 대해 (로그)차분을 수행한 새 컬럼을 추가하고 결측치를 처리합니다.
-    (이전 버전과 동일하며, 파이프라인의 일부로 사용됩니다)
+    transform:
+      - 'log'    : 가능하면 로그차분, 비양수 있으면 단순차분으로 폴백
+      - 'simple' : 무조건 단순차분
+      - 'auto'   : 컬럼값이 모두 양수면 로그차분, 아니면 단순차분
     """
     df_new = df.copy()
     new_col_names = []
@@ -47,24 +51,43 @@ def add_diff_columns_pro(
         
         new_col_name = col + suffix
         new_col_names.append(new_col_name)
-        
+
         try:
-            if transform == 'log':
-                if (df_new[col] <= 0).any():
-                    print(f"[Warning] Column '{col}' contains non-positive values. Log transform skipped; performing simple differencing instead.")
-                    df_new[new_col_name] = df_new[col].diff(diff_order)
+            s = df_new[col].astype(float)
+
+            if transform == 'auto':
+                if (s > 0).all():
+                    df_new[new_col_name] = np.log(s).diff(diff_order)
+                    # 선택: 어떤 변환 썼는지 로그
+                    # print(f"[Info] '{col}': auto -> log-diff")
                 else:
-                    df_new[new_col_name] = np.log(df_new[col]).diff(diff_order)
+                    df_new[new_col_name] = s.diff(diff_order)
+                    # print(f"[Info] '{col}': auto -> simple diff (non-positive present)")
+
+            elif transform == 'log':
+                if (s <= 0).any():
+                    print(f"[Warning] Column '{col}' contains non-positive values. Log transform skipped; performing simple differencing instead.")
+                    df_new[new_col_name] = s.diff(diff_order)
+                else:
+                    df_new[new_col_name] = np.log(s).diff(diff_order)
+
             elif transform == 'simple':
-                df_new[new_col_name] = df_new[col].diff(diff_order)
+                df_new[new_col_name] = s.diff(diff_order)
+
             else:
                 print(f"[Warning] Invalid transform type '{transform}'. Skipping column '{col}'.")
+                new_col_names.pop()  # 방금 추가한 이름 제거
                 continue
+
         except Exception as e:
             print(f"[Error] Could not process column '{col}'. Error: {e}")
+            # 실패한 컬럼명 제거
+            if new_col_name in new_col_names:
+                new_col_names.remove(new_col_name)
             
     df_processed = df_new.dropna(subset=new_col_names).reset_index(drop=True)
     return df_processed
+
 
 def granger_causality_test_pro(
     df,
@@ -93,8 +116,8 @@ def granger_causality_test_pro(
             continue
         
         directions = [
-            {'causal': var, 'effect': target_col, 'data': df_tmp},
-            {'causal': target_col, 'effect': var, 'data': df_tmp[[target_col, var]]}
+            {'causal': var, 'effect': target_col, 'data': df_tmp[[target_col, var]]},
+            {'causal': target_col, 'effect': var, 'data': df_tmp[[var, target_col]]}
         ]
 
         for direction in directions:
@@ -123,7 +146,7 @@ def run_granger_analysis_pipeline(
     base_vars,
     target_col,
     max_lag=5,
-    transform='log',
+    transform='auto',
     suffix='_diff'
 ):
     """
